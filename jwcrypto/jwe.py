@@ -475,7 +475,12 @@ class JWE:
                     missingkey = True
                 self.decryptlog.append('Failed: [%s]' % repr(e))
 
-        if not self.plaintext:
+        # An empty byte string (b'') is a valid plaintext: it is used for
+        # JWE envelopes that only authenticate the sender and carry no data.
+        # Only the None sentinel, set on reset and on failure, indicates that
+        # no recipient decrypted the token, so test identity explicitly rather
+        # than truthiness.
+        if self.plaintext is None:
             if missingkey:
                 raise JWKeyNotFound("Key Not found in JWKSet")
             raise InvalidJWEData('No recipient matched the provided '
@@ -561,7 +566,9 @@ class JWE:
 
     @property
     def payload(self):
-        if not self.plaintext:
+        # None is the failure/not-decrypted sentinel; an empty byte string is
+        # a legitimate decrypted payload, so check identity explicitly.
+        if self.plaintext is None:
             raise InvalidJWEOperation("Plaintext not available")
         return self.plaintext
 

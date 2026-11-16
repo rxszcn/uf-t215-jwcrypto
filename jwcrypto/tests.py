@@ -1819,6 +1819,107 @@ class TestJWE(unittest.TestCase):
         b.decrypt(key_pbes)
         self.assertEqual(b.payload, payload)
 
+    def test_empty_payload_matrix(self):
+        # An empty byte string is a legal plaintext: heartbeat/ack envelopes
+        # that only authenticate the sender and carry no data. It must round
+        # trip across the full matrix of serialization forms, compression
+        # settings and key management modes.
+        key = jwk.JWK.generate(kty='oct', size=256)
+
+        # (label, serialize compact?, flattened JSON?)
+        forms = [('compact', True, True),
+                 ('json-flat', False, True),
+                 ('json-general', False, False)]
+        zips = [(None, False), ('DEF', True)]
+        algs = ['dir', 'A256KW']
+
+        for form, compact, flattened in forms:
+            for zip_name, use_zip in zips:
+                for alg in algs:
+                    protected = {'alg': alg, 'enc': 'A256GCM'}
+                    if use_zip:
+                        protected['zip'] = zip_name
+                    enc = jwe.JWE(plaintext=b'', protected=protected,
+                                  flattened=flattened)
+                    enc.add_recipient(key)
+                    token = enc.serialize(compact=compact)
+
+                    dec = jwe.JWE()
+                    # deserialize() invokes decrypt() internally; before the
+                    # fix this raised InvalidJWEData despite logging Success.
+                    dec.deserialize(token, key)
+                    self.assertEqual(dec.payload, b'',
+                                     'empty payload mismatch for %s/%s/%s'
+                                     % (form, zip_name, alg))
+                    self.assertEqual(dec.plaintext, b'')
+
+    def test_empty_payload_multiple_recipients(self):
+        # Empty payloads must not confuse the first-success early exit: the
+        # None failure sentinel is distinct from a valid b'' plaintext.
+        key1 = jwk.JWK.generate(kty='oct', size=256)
+        key2 = jwk.JWK.generate(kty='oct', size=256)
+        enc = jwe.JWE(plaintext=b'', protected={'enc': 'A256GCM'},
+                      flattened=False)
+        enc.add_recipient(key1, header={'alg': 'A256KW', 'kid': 'key1'})
+        enc.add_recipient(key2, header={'alg': 'A256KW', 'kid': 'key2'})
+        token = enc.serialize()
+
+        first = jwe.JWE()
+        first.deserialize(token)
+        first.decrypt(key1)
+        self.assertEqual(first.payload, b'')
+        self.assertEqual(first.decryptlog, ['Success'])
+
+        second = jwe.JWE()
+        second.deserialize(token)
+        second.decrypt(key2)
+        self.assertEqual(second.payload, b'')
+        self.assertTrue(second.decryptlog[0].startswith('Failed:'))
+        self.assertEqual(second.decryptlog[-1], 'Success')
+
+        # A key set with no matching key still reports the key-not-found
+        # sentinel rather than the misleading "no recipient" data error.
+        alien = jwk.JWK.generate(kty='oct', size=256, kid='alien')
+        ks = jwk.JWKSet()
+        ks.add(alien)
+        nomatch = jwe.JWE()
+        nomatch.deserialize(token)
+        with self.assertRaises(JWKeyNotFound):
+            nomatch.decrypt(ks)
+        self.assertIsNone(nomatch.plaintext)
+
+    def test_empty_payload_failure_sentinel(self):
+        # The None sentinel keeps meaning "not decrypted": payload access on
+        # a fresh object and on a failed decrypt must keep raising, while the
+        # empty byte string returned by a successful decrypt is exposed as-is.
+        fresh = jwe.JWE()
+        self.assertIsNone(fresh.plaintext)
+        with self.assertRaises(jwe.InvalidJWEOperation):
+            fresh.payload  # pylint: disable=pointless-statement
+
+        key = jwk.JWK.generate(kty='oct', size=256)
+        wrong = jwk.JWK.generate(kty='oct', size=256)
+        enc = jwe.JWE(plaintext=b'',
+                      protected={'alg': 'dir', 'enc': 'A256GCM'})
+        enc.add_recipient(key)
+        token = enc.serialize(compact=True)
+
+        failed = jwe.JWE()
+        failed.deserialize(token)
+        with self.assertRaises(jwe.InvalidJWEData):
+            failed.decrypt(wrong)
+        self.assertIsNone(failed.plaintext)
+        with self.assertRaises(jwe.InvalidJWEOperation):
+            failed.payload  # pylint: disable=pointless-statement
+
+        # Non-empty payloads keep working on the same code paths.
+        nonempty = jwe.JWE(plaintext=b'heartbeat',
+                           protected={'alg': 'A256KW', 'enc': 'A256GCM'})
+        nonempty.add_recipient(key)
+        dec = jwe.JWE()
+        dec.deserialize(nonempty.serialize(), key)
+        self.assertEqual(dec.payload, b'heartbeat')
+
     def test_jwe_zip_in_unprotected_header(self):
         payload = b'test-zip'
         key = jwk.JWK.generate(kty='oct', size=128)
